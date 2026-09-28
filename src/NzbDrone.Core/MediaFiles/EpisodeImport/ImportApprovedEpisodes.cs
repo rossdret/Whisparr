@@ -184,7 +184,12 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
                     _logger.Warn(e, "Couldn't import episode " + localEpisode);
                     importResults.Add(new ImportResult(importDecision, "Failed to import episode, Destination already exists."));
 
-                    _commandQueueManager.Push(new RescanSeriesCommand(localEpisode.Series.Id));
+                    // A rescan cannot resolve a collision with a file already indexed for this series.
+                    // Keep recovery scans for destinations that may not have been imported into the database.
+                    if (!IsDestinationIndexed(localEpisode, e.DestinationPath))
+                    {
+                        _commandQueueManager.Push(new RescanSeriesCommand(localEpisode.Series.Id));
+                    }
                 }
                 catch (RecycleBinException e)
                 {
@@ -205,6 +210,30 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
                                             .Select(d => new ImportResult(d, d.Rejections.Select(r => r.Message).ToArray())));
 
             return importResults;
+        }
+
+        private bool IsDestinationIndexed(LocalEpisode localEpisode, string destinationPath)
+        {
+            if (destinationPath.IsNullOrWhiteSpace())
+            {
+                return false;
+            }
+
+            try
+            {
+                if (!localEpisode.Series.Path.IsParentPath(destinationPath))
+                {
+                    return false;
+                }
+
+                var relativePath = localEpisode.Series.Path.GetRelativePath(destinationPath);
+                return _mediaFileService.GetFilesWithRelativePath(localEpisode.Series.Id, relativePath).Any();
+            }
+            catch (Exception e)
+            {
+                _logger.Debug(e, "Unable to check whether destination is already indexed: {0}", destinationPath);
+                return false;
+            }
         }
 
         private string GetOriginalFilePath(DownloadClientItem downloadClientItem, LocalEpisode localEpisode)

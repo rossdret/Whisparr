@@ -9,8 +9,10 @@ using NzbDrone.Common.Disk;
 using NzbDrone.Core.Download;
 using NzbDrone.Core.History;
 using NzbDrone.Core.MediaFiles;
+using NzbDrone.Core.MediaFiles.Commands;
 using NzbDrone.Core.MediaFiles.EpisodeImport;
 using NzbDrone.Core.MediaFiles.Events;
+using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Messaging.Events;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Profiles.Qualities;
@@ -32,6 +34,9 @@ namespace NzbDrone.Core.Test.MediaFiles.EpisodeImport
         [SetUp]
         public void Setup()
         {
+            // The shared logger's first initialization can replace the inherited logging configuration.
+            InitLogging();
+
             _rejectedDecisions = new List<ImportDecision>();
             _approvedDecisions = new List<ImportDecision>();
 
@@ -150,6 +155,184 @@ namespace NzbDrone.Core.Test.MediaFiles.EpisodeImport
 
             Mocker.GetMock<IEventAggregator>()
                 .Verify(v => v.PublishEvent(It.IsAny<EpisodeImportedEvent>()), Times.Once());
+        }
+
+        [Test]
+        public void should_not_rescan_repeated_collisions_with_an_indexed_destination()
+        {
+            GivenNewDownload();
+
+            var decision = _approvedDecisions.First();
+            var relativePath = Path.Combine("Season 1", "Example Series - Episode 1.mkv");
+            var destinationPath = Path.Combine(decision.LocalEpisode.Series.Path, relativePath);
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), decision.LocalEpisode, It.IsAny<bool>()))
+                  .Throws(new DestinationAlreadyExistsException("Destination already exists.", destinationPath, null));
+
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.GetFilesWithRelativePath(decision.LocalEpisode.Series.Id, relativePath))
+                  .Returns(new List<EpisodeFile> { new EpisodeFile { Id = 99, RelativePath = relativePath } });
+
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var result = Subject.Import(new List<ImportDecision> { decision }, true).Single();
+
+                result.Result.Should().Be(ImportResultType.Skipped);
+                result.Errors.Should().Contain("Failed to import episode, Destination already exists.");
+            }
+
+            Mocker.GetMock<IManageCommandQueue>()
+                  .Verify(s => s.Push(It.IsAny<RescanSeriesCommand>(), It.IsAny<CommandPriority>(), It.IsAny<CommandTrigger>()), Times.Never());
+
+            Mocker.GetMock<IMediaFileService>().Verify(s => s.Add(It.IsAny<EpisodeFile>()), Times.Never());
+            Mocker.GetMock<IMediaFileService>()
+                  .Verify(s => s.GetFilesWithRelativePath(decision.LocalEpisode.Series.Id, relativePath), Times.Exactly(2));
+            Mocker.GetMock<IEventAggregator>().Verify(s => s.PublishEvent(It.IsAny<EpisodeImportedEvent>()), Times.Never());
+
+            ExceptionVerification.ExpectedWarns(2);
+        }
+
+        [Test]
+        public void should_rescan_a_collision_with_an_unindexed_destination()
+        {
+            GivenNewDownload();
+            GivenExistingFileOnDisk();
+
+            var decision = _approvedDecisions.First();
+            var destinationPath = Path.Combine(decision.LocalEpisode.Series.Path, "Example Series - Episode 1.mkv");
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), decision.LocalEpisode, It.IsAny<bool>()))
+                  .Throws(new DestinationAlreadyExistsException("Destination already exists.", destinationPath, null));
+
+            var result = Subject.Import(new List<ImportDecision> { decision }, true).Single();
+
+            result.Result.Should().Be(ImportResultType.Skipped);
+            Mocker.GetMock<IManageCommandQueue>()
+                  .Verify(s => s.Push(It.Is<RescanSeriesCommand>(c => c.SeriesId == decision.LocalEpisode.Series.Id), It.IsAny<CommandPriority>(), It.IsAny<CommandTrigger>()), Times.Once());
+
+            ExceptionVerification.ExpectedWarns(1);
+        }
+
+        [Test]
+        public void should_rescan_a_collision_without_a_destination_path()
+        {
+            GivenNewDownload();
+
+            var decision = _approvedDecisions.First();
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), decision.LocalEpisode, It.IsAny<bool>()))
+                  .Throws(new DestinationAlreadyExistsException("Destination already exists."));
+
+            var result = Subject.Import(new List<ImportDecision> { decision }, true).Single();
+
+            result.Result.Should().Be(ImportResultType.Skipped);
+            Mocker.GetMock<IMediaFileService>()
+                  .Verify(s => s.GetFilesWithRelativePath(It.IsAny<int>(), It.IsAny<string>()), Times.Never());
+            Mocker.GetMock<IManageCommandQueue>()
+                  .Verify(s => s.Push(It.Is<RescanSeriesCommand>(c => c.SeriesId == decision.LocalEpisode.Series.Id), It.IsAny<CommandPriority>(), It.IsAny<CommandTrigger>()), Times.Once());
+
+            ExceptionVerification.ExpectedWarns(1);
+        }
+
+        [Test]
+        public void should_rescan_a_collision_outside_the_series_path()
+        {
+            GivenNewDownload();
+
+            var decision = _approvedDecisions.First();
+            var destinationPath = Path.Combine(decision.LocalEpisode.Series.Path + " Other", "Example Series - Episode 1.mkv");
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), decision.LocalEpisode, It.IsAny<bool>()))
+                  .Throws(new DestinationAlreadyExistsException("Destination already exists.", destinationPath, null));
+
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.GetFilesWithRelativePath(It.IsAny<int>(), It.IsAny<string>()))
+                  .Returns(new List<EpisodeFile> { new EpisodeFile { Id = 99 } });
+
+            var result = Subject.Import(new List<ImportDecision> { decision }, true).Single();
+
+            result.Result.Should().Be(ImportResultType.Skipped);
+            Mocker.GetMock<IMediaFileService>()
+                  .Verify(s => s.GetFilesWithRelativePath(It.IsAny<int>(), It.IsAny<string>()), Times.Never());
+            Mocker.GetMock<IManageCommandQueue>()
+                  .Verify(s => s.Push(It.Is<RescanSeriesCommand>(c => c.SeriesId == decision.LocalEpisode.Series.Id), It.IsAny<CommandPriority>(), It.IsAny<CommandTrigger>()), Times.Once());
+
+            ExceptionVerification.ExpectedWarns(1);
+        }
+
+        [Test]
+        public void should_continue_importing_other_files_after_an_indexed_destination_collision()
+        {
+            GivenNewDownload();
+
+            var decisions = _approvedDecisions.Take(2).ToList();
+            var collision = decisions.First();
+            var successful = decisions.Last();
+            var relativePath = "Example Series - Episode 1.mkv";
+            var destinationPath = Path.Combine(collision.LocalEpisode.Series.Path, relativePath);
+            successful.LocalEpisode.Path = Path.Combine(_downloadClientItem.OutputPath.ToString(), "Example Series - Episode 2.mkv");
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), collision.LocalEpisode, It.IsAny<bool>()))
+                  .Throws(new DestinationAlreadyExistsException("Destination already exists.", destinationPath, null));
+
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.GetFilesWithRelativePath(collision.LocalEpisode.Series.Id, relativePath))
+                  .Returns(new List<EpisodeFile> { new EpisodeFile { Id = 99, RelativePath = relativePath } });
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.Add(It.IsAny<EpisodeFile>()))
+                  .Returns<EpisodeFile>(file => file);
+
+            var results = Subject.Import(decisions, true);
+
+            results.Should().ContainSingle(r => r.ImportDecision == collision && r.Result == ImportResultType.Skipped);
+            results.Should().ContainSingle(r => r.ImportDecision == successful && r.Result == ImportResultType.Imported);
+            Mocker.GetMock<IMediaFileService>().Verify(s => s.Add(It.IsAny<EpisodeFile>()), Times.Once());
+            Mocker.GetMock<IEventAggregator>().Verify(s => s.PublishEvent(It.IsAny<EpisodeImportedEvent>()), Times.Once());
+            Mocker.GetMock<IManageCommandQueue>()
+                  .Verify(s => s.Push(It.IsAny<RescanSeriesCommand>(), It.IsAny<CommandPriority>(), It.IsAny<CommandTrigger>()), Times.Never());
+
+            ExceptionVerification.ExpectedWarns(1);
+        }
+
+        [Test]
+        public void should_continue_importing_other_files_when_destination_lookup_fails()
+        {
+            GivenNewDownload();
+
+            var decisions = _approvedDecisions.Take(2).ToList();
+            var collision = decisions.First();
+            var successful = decisions.Last();
+            var relativePath = "Example Series - Episode 1.mkv";
+            var destinationPath = Path.Combine(collision.LocalEpisode.Series.Path, relativePath);
+            successful.LocalEpisode.Path = Path.Combine(_downloadClientItem.OutputPath.ToString(), "Example Series - Episode 2.mkv");
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), collision.LocalEpisode, It.IsAny<bool>()))
+                  .Throws(new DestinationAlreadyExistsException("Destination already exists.", destinationPath, null));
+
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.GetFilesWithRelativePath(collision.LocalEpisode.Series.Id, relativePath))
+                  .Throws(new IOException("The destination index is temporarily unavailable."));
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.Add(It.IsAny<EpisodeFile>()))
+                  .Returns<EpisodeFile>(file => file);
+
+            var results = Subject.Import(decisions, true);
+
+            results.Should().ContainSingle(r => r.ImportDecision == collision && r.Result == ImportResultType.Skipped);
+            results.Single(r => r.ImportDecision == collision).Errors.Should().Contain("Failed to import episode, Destination already exists.");
+            results.Should().ContainSingle(r => r.ImportDecision == successful && r.Result == ImportResultType.Imported);
+            Mocker.GetMock<IMediaFileService>().Verify(s => s.Add(It.IsAny<EpisodeFile>()), Times.Once());
+            Mocker.GetMock<IEventAggregator>().Verify(s => s.PublishEvent(It.IsAny<EpisodeImportedEvent>()), Times.Once());
+            Mocker.GetMock<IManageCommandQueue>()
+                  .Verify(s => s.Push(It.Is<RescanSeriesCommand>(c => c.SeriesId == collision.LocalEpisode.Series.Id), It.IsAny<CommandPriority>(), It.IsAny<CommandTrigger>()), Times.Once());
+
+            ExceptionVerification.ExpectedWarns(1);
         }
 
         [Test]
