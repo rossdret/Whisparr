@@ -379,7 +379,7 @@ namespace NzbDrone.Common.Disk
                 }
                 else
                 {
-                    throw new DestinationAlreadyExistsException($"Destination {targetPath} already exists.");
+                    throw new DestinationAlreadyExistsException($"Destination {targetPath} already exists.", targetPath, null);
                 }
             }
         }

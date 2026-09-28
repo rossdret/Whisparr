@@ -256,12 +256,16 @@ namespace NzbDrone.Common.Test.DiskTests
                 .Verify(v => v.MoveFile(_sourcePath, _targetPath, false), Times.Once());
         }
 
-        [Test]
-        public void should_throw_if_existing_target_when_not_overwriting()
+        [TestCase(TransferMode.Move)]
+        [TestCase(TransferMode.Copy)]
+        [TestCase(TransferMode.HardLink)]
+        public void should_throw_if_existing_target_when_not_overwriting(TransferMode mode)
         {
             WithExistingFile(_targetPath);
 
-            Assert.Throws<DestinationAlreadyExistsException>(() => Subject.TransferFile(_sourcePath, _targetPath, TransferMode.Move, false));
+            var exception = Assert.Throws<DestinationAlreadyExistsException>(() => Subject.TransferFile(_sourcePath, _targetPath, mode, false));
+
+            exception.DestinationPath.Should().Be(_targetPath);
 
             Mocker.GetMock<IDiskProvider>()
                 .Verify(v => v.DeleteFile(_targetPath), Times.Never());
